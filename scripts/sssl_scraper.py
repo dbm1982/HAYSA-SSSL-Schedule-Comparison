@@ -75,7 +75,7 @@ HOLA_TS_TO_DIVISION = {
 # -----------------------------
 # Location Mapping
 # -----------------------------
-mapping_path = r"G:/My Drive/HAYSA/WebMaster Files/Location Mapping.xlsx"
+mapping_path = "data/mapping/Location Mapping.xlsx"
 mapping_df = pd.read_excel(mapping_path)
 
 def clean_location(loc):
