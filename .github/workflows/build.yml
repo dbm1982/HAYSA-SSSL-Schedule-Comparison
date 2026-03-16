@@ -1,0 +1,54 @@
+name: HAYSA / SSSL Schedule Automation
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 10 * * *"   # Runs daily at 10:00 AM Eastern
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas openpyxl xlsxwriter playwright
+
+      - name: Install Playwright Chromium
+        run: |
+          python -m playwright install chromium
+
+      - name: Run SSSL scraper
+        run: |
+          python scripts/sssl.scraper.py
+
+      - name: Run HAYSA scraper
+        run: |
+          python scripts/haysa_scraper.py
+
+      - name: Run comparison script
+        run: |
+          python compare_schedules.py
+
+      - name: Commit updated schedule files
+        run: |
+          git config --global user.name "github-actions"
+          git config --global user.email "github-actions@github.com"
+          git add data/sssl/*.xlsx
+          git add data/haysa/*.xlsx
+          git add data/merged/*.xlsx
+          git commit -m "Automated schedule update" || echo "No changes to commit"
+
+      - name: Push changes
+        uses: ad-m/github-push-action@v0.8.0
+        with:
+          github_token: ${{ secrets.GITHUB_TOKEN }}
