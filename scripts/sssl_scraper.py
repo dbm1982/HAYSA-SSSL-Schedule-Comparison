@@ -1,11 +1,12 @@
 # scripts/sssl_scraper.py
 
+import asyncio
 import re
-import requests
 from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
+from playwright.async_api import async_playwright
 
 # =========================
 # CONFIG
@@ -17,7 +18,8 @@ CONTESTS_URL = (
 )
 
 REPORT_BASE_URL = (
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest={cid}&header=on&print=1"
+    "https://sssl.sportspilot.com/Scheduler/public/report.aspx"
+    "?contest={cid}&header=on&print=1"
 )
 
 def detect_season_label():
@@ -40,59 +42,67 @@ SAVE_PATH = OUTPUT_DIR / f"SSSL_{SEASON_LABEL.replace(' ', '_')}_Schedule.xlsx"
 MAPPING_PATH = REPO_ROOT / "data" / "mapping" / "Location Mapping.xlsx"
 
 # =========================
-# HELPER FUNCTIONS
+# HELPERS
 # =========================
 
 def load_location_mapping():
     if not MAPPING_PATH.exists():
-        print(f"No mapping file found at: {MAPPING_PATH} (continuing without mapping)")
+        print(f"No mapping file found at: {MAPPING_PATH}")
         return None
+
     print(f"Using mapping file: {MAPPING_PATH}")
-    mapping_df = pd.read_excel(MAPPING_PATH)
-    # Expect columns like: "Raw Location", "Mapped Location"
-    # Adjust if your actual column names differ.
-    mapping_df = mapping_df.rename(
+    df = pd.read_excel(MAPPING_PATH)
+    df = df.rename(
         columns={
-            mapping_df.columns[0]: "Raw Location",
-            mapping_df.columns[1]: "Mapped Location",
+            df.columns[0]: "Raw Location",
+            df.columns[1]: "Mapped Location",
         }
     )
-    return mapping_df
+    return df
 
 
-def get_contest_ids():
+async def safe_goto(page, url):
+    try:
+        return await page.goto(url, wait_until="networkidle", timeout=45000)
+    except:
+        print(f"Retrying navigation to {url} with wait_until='load'...")
+        return await page.goto(url, wait_until="load", timeout=45000)
+
+
+async def get_contest_ids(page):
     print(f"Loading contests page: {CONTESTS_URL}")
-    resp = requests.get(CONTESTS_URL, timeout=30)
-    resp.raise_for_status()
+    await safe_goto(page, CONTESTS_URL)
+    await page.wait_for_timeout(1500)
 
-    html = resp.text
-    # Find all contest=#### patterns
+    html = await page.content()
     ids = re.findall(r"contest=(\d+)", html)
     unique_ids = sorted(set(ids))
+
     print(f"Discovered {len(unique_ids)} contest IDs: {unique_ids}")
     return unique_ids
 
 
-def fetch_contest_table(contest_id):
+async def fetch_contest_table(page, contest_id):
     url = REPORT_BASE_URL.format(cid=contest_id)
     print(f"Loading contest: {url}")
-    resp = requests.get(url, timeout=30)
-    resp.raise_for_status()
 
-    # Parse all tables on the page
-    tables = pd.read_html(resp.text)
+    await safe_goto(page, url)
+    await page.wait_for_timeout(1500)
+
+    html = await page.content()
+    tables = pd.read_html(html)
+
     if not tables:
         print(f"No tables found for contest {contest_id}")
         return None
 
     df = tables[0].copy()
-    # Try to normalize columns if needed
-    # Adjust this block if your table structure differs.
+
+    # Normalize columns if possible
     if len(df.columns) >= 5:
         df = df.iloc[:, :5]
         df.columns = ["Date", "Time", "Home", "Away", "Location"]
     else:
-        # Fallback: keep whatever columns exist
         df.columns = [str(c) for c in df.columns]
 
     df["Contest ID"] = contest_id
@@ -109,39 +119,63 @@ def apply_location_mapping(df, mapping_df):
         right_on="Raw Location",
         how="left",
     )
-    # If mapping exists, use it; otherwise keep original
+
     df["Location Mapped"] = df["Mapped Location"].fillna(df["Location"])
     df.drop(columns=["Raw Location", "Mapped Location"], inplace=True, errors="ignore")
     return df
 
 
 # =========================
-# MAIN SCRAPE LOGIC
+# MAIN SCRAPER
 # =========================
 
-def run_sssl_scraper():
+async def run_sssl_scraper():
     print(f"=== SSSL Schedule Scrape Started ({SEASON_LABEL}) ===")
     print(f"Output will be written to: {SAVE_PATH}")
 
     mapping_df = load_location_mapping()
-    contest_ids = get_contest_ids()
-    if not contest_ids:
-        print("No contest IDs discovered — aborting")
-        return
 
-    all_frames = []
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
 
-    for cid in contest_ids:
-        try:
-            df = fetch_contest_table(cid)
-            if df is None or df.empty:
-                print(f"No data for contest {cid}")
-                continue
+        page = await browser.new_page(
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/123.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 900},
+            locale="en-US",
+        )
 
-            df = apply_location_mapping(df, mapping_df)
-            all_frames.append(df)
-        except Exception as e:
-            print(f"Error processing contest {cid}: {e}")
+        contest_ids = await get_contest_ids(page)
+        if not contest_ids:
+            print("No contest IDs found — aborting")
+            return
+
+        all_frames = []
+
+        for cid in contest_ids:
+            try:
+                df = await fetch_contest_table(page, cid)
+                if df is None or df.empty:
+                    print(f"No data for contest {cid}")
+                    continue
+
+                df = apply_location_mapping(df, mapping_df)
+                all_frames.append(df)
+
+            except Exception as e:
+                print(f"Error processing contest {cid}: {e}")
+
+        await browser.close()
 
     if not all_frames:
         print("No valid contest data collected — nothing to save")
@@ -159,7 +193,7 @@ def run_sssl_scraper():
 
 
 def main():
-    run_sssl_scraper()
+    asyncio.run(run_sssl_scraper())
 
 
 if __name__ == "__main__":
