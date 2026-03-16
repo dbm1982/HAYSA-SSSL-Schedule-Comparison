@@ -29,7 +29,7 @@ jobs:
 
       - name: Run SSSL scraper
         run: |
-          python scripts/sssl.scraper.py
+          python scripts/sssl_scraper.py
 
       - name: Run HAYSA scraper
         run: |
