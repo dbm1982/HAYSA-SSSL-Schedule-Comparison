@@ -1,233 +1,165 @@
-# scripts/sssl.scraper.py
+# scripts/sssl_scraper.py
 
-import asyncio
+import re
+import requests
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
-from playwright.async_api import async_playwright
 
-# -----------------------------
-# 2026 Contest URLs
-# -----------------------------
-contest_links = [
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2266&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2268&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2265&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2260&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2256&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2257&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2250&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2252&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2248&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2254&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2235&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2238&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2241&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2242&header=on&print=1",
-    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest=2244&header=on&print=1",
-]
+# =========================
+# CONFIG
+# =========================
 
-# -----------------------------
-# Helpers
-# -----------------------------
-def normalize_location(raw_loc: str) -> str:
-    """
-    Normalize SSSL Location to match 'SSSL Field Name' in mapping file.
-    - If it contains ' / ', take the part after the slash.
-    - Otherwise, return as-is.
-    """
-    if not isinstance(raw_loc, str):
-        return ""
-    raw_loc = raw_loc.strip()
-    if " / " in raw_loc:
-        return raw_loc.split(" / ", 1)[1].strip()
-    return raw_loc
-
-
-def extract_town_abbr(team_name: str) -> str:
-    """
-    Extract town abbreviation from a team name.
-    e.g. "ABG BPG.2 (Ziady)" -> "ABG"
-    """
-    if not isinstance(team_name, str) or not team_name.strip():
-        return ""
-    return team_name.split(" ", 1)[0].strip()
-
-
-# Output columns (match Selenium version)
-HEADERS = [
-    "Event ID", "Date", "Time", "Location",
-    "Schedule Name", "Visitor", "V", "Home", "H"
-]
-
-# XPaths (same structure as Selenium version)
-SCHEDULE_CONTAINER_XPATH = (
-    "/html/body/form/div[3]/table[3]/tbody/tr/td/div/div[2]"
+CONTESTS_URL = (
+    "https://sssl.sportspilot.com/Scheduler/public/contests.aspx"
+    "?programid=1083&header=on&smode=&sportid="
 )
 
-ROW_XPATH = (
-    "/html/body/form/div[3]/table[3]/tbody/tr/td/div/div[2]/table/"
-    "tbody/tr/td[2]/table/tbody/tr/td/div/div[1]/table/tbody/tr"
+REPORT_BASE_URL = (
+    "https://sssl.sportspilot.com/Scheduler/public/report.aspx?contest={cid}&header=on&print=1"
 )
 
+def detect_season_label():
+    now = datetime.now()
+    year = now.year
+    month = now.month
+    if month in (3, 4, 5, 6):
+        return f"Spring {year}"
+    elif month in (8, 9, 10, 11):
+        return f"Fall {year}"
+    return f"{year}"
 
-# -----------------------------
-# Playwright scraping
-# -----------------------------
-async def scrape_contest(page, contest_url: str):
-    print(f"Loading contest: {contest_url}")
-    await page.goto(contest_url, wait_until="networkidle")
+SEASON_LABEL = detect_season_label()
 
-    # Wait for the schedule container to exist
-    await page.wait_for_selector(f"xpath={SCHEDULE_CONTAINER_XPATH}")
+REPO_ROOT = Path(__file__).resolve().parents[1]
+OUTPUT_DIR = REPO_ROOT / "data" / "sssl"
+OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+SAVE_PATH = OUTPUT_DIR / f"SSSL_{SEASON_LABEL.replace(' ', '_')}_Schedule.xlsx"
 
-    # Get all rows in the real schedule table
-    rows = await page.locator(f"xpath={ROW_XPATH}").all()
+MAPPING_PATH = REPO_ROOT / "data" / "mapping" / "Location Mapping.xlsx"
 
-    contest_rows = []
+# =========================
+# HELPER FUNCTIONS
+# =========================
 
-    for row in rows:
-        cells = await row.locator("td").all_text_contents()
-        values = [c.strip() for c in cells]
+def load_location_mapping():
+    if not MAPPING_PATH.exists():
+        print(f"No mapping file found at: {MAPPING_PATH} (continuing without mapping)")
+        return None
+    print(f"Using mapping file: {MAPPING_PATH}")
+    mapping_df = pd.read_excel(MAPPING_PATH)
+    # Expect columns like: "Raw Location", "Mapped Location"
+    # Adjust if your actual column names differ.
+    mapping_df = mapping_df.rename(
+        columns={
+            mapping_df.columns[0]: "Raw Location",
+            mapping_df.columns[1]: "Mapped Location",
+        }
+    )
+    return mapping_df
 
-        # There is an extra leading <td> (blank/checkbox), so we need at least 10 cells.
-        if len(values) < 10:
-            continue
 
-        # Corrected mapping (shifted by +1 because values[0] is blank)
-        cleaned = [
-            values[1],  # Event ID
-            values[2],  # Date
-            values[3],  # Time
-            values[5],  # Location (raw SSSL string)
-            None,       # Schedule Name (placeholder)
-            values[6],  # Visitor
-            values[7],  # V
-            values[8],  # Home
-            values[9],  # H
-        ]
+def get_contest_ids():
+    print(f"Loading contests page: {CONTESTS_URL}")
+    resp = requests.get(CONTESTS_URL, timeout=30)
+    resp.raise_for_status()
 
-        contest_rows.append(cleaned)
+    html = resp.text
+    # Find all contest=#### patterns
+    ids = re.findall(r"contest=(\d+)", html)
+    unique_ids = sorted(set(ids))
+    print(f"Discovered {len(unique_ids)} contest IDs: {unique_ids}")
+    return unique_ids
 
-    if not contest_rows:
-        print(f"No rows found for contest: {contest_url}")
+
+def fetch_contest_table(contest_id):
+    url = REPORT_BASE_URL.format(cid=contest_id)
+    print(f"Loading contest: {url}")
+    resp = requests.get(url, timeout=30)
+    resp.raise_for_status()
+
+    # Parse all tables on the page
+    tables = pd.read_html(resp.text)
+    if not tables:
+        print(f"No tables found for contest {contest_id}")
         return None
 
-    df = pd.DataFrame(contest_rows, columns=HEADERS)
-    df.dropna(how="all", inplace=True)
+    df = tables[0].copy()
+    # Try to normalize columns if needed
+    # Adjust this block if your table structure differs.
+    if len(df.columns) >= 5:
+        df = df.iloc[:, :5]
+        df.columns = ["Date", "Time", "Home", "Away", "Location"]
+    else:
+        # Fallback: keep whatever columns exist
+        df.columns = [str(c) for c in df.columns]
 
-    if df.empty:
-        print(f"Empty DataFrame after cleaning for contest: {contest_url}")
-        return None
-
+    df["Contest ID"] = contest_id
     return df
 
 
-async def run_sssl_scraper():
-    repo_root = Path(__file__).resolve().parents[1]
-    mapping_path = repo_root / "data" / "mapping" / "Location Mapping.xlsx"
-    output_dir = repo_root / "data" / "sssl"
-    output_dir.mkdir(parents=True, exist_ok=True)
-    save_path = output_dir / "SSSL_Spring_2026_Schedule.xlsx"
+def apply_location_mapping(df, mapping_df):
+    if mapping_df is None or "Location" not in df.columns:
+        return df
 
-    print(f"Using mapping file: {mapping_path}")
-    print(f"Output will be written to: {save_path}")
+    df = df.merge(
+        mapping_df,
+        left_on="Location",
+        right_on="Raw Location",
+        how="left",
+    )
+    # If mapping exists, use it; otherwise keep original
+    df["Location Mapped"] = df["Mapped Location"].fillna(df["Location"])
+    df.drop(columns=["Raw Location", "Mapped Location"], inplace=True, errors="ignore")
+    return df
 
-    all_data = []
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
-        page = await browser.new_page(viewport={"width": 1920, "height": 3000})
+# =========================
+# MAIN SCRAPE LOGIC
+# =========================
 
-        try:
-            for url in contest_links:
-                df = await scrape_contest(page, url)
-                if df is not None and not df.empty:
-                    all_data.append(df)
-                else:
-                    print(f"No valid data for contest: {url}")
+def run_sssl_scraper():
+    print(f"=== SSSL Schedule Scrape Started ({SEASON_LABEL}) ===")
+    print(f"Output will be written to: {SAVE_PATH}")
 
-        finally:
-            await browser.close()
-
-    if not all_data:
-        print("No schedule data found across all contests.")
+    mapping_df = load_location_mapping()
+    contest_ids = get_contest_ids()
+    if not contest_ids:
+        print("No contest IDs discovered — aborting")
         return
 
-    # -----------------------------
-    # Combine & Apply Location + Town Mapping
-    # -----------------------------
-    master_df = pd.concat(all_data, ignore_index=True)
+    all_frames = []
 
-    # Load mapping file
-    mapping_df = pd.read_excel(mapping_path)
+    for cid in contest_ids:
+        try:
+            df = fetch_contest_table(cid)
+            if df is None or df.empty:
+                print(f"No data for contest {cid}")
+                continue
 
-    # Build:
-    #  - FIELD_MAP: SSSL Field Name -> TS Field Code
-    #  - TOWN_MAP: Town Abbreviation -> Town Name
-    FIELD_MAP = dict(zip(
-        mapping_df["SSSL Field Name"],
-        mapping_df["TS Field Code"]
-    ))
+            df = apply_location_mapping(df, mapping_df)
+            all_frames.append(df)
+        except Exception as e:
+            print(f"Error processing contest {cid}: {e}")
 
-    TOWN_MAP = dict(zip(
-        mapping_df["Town Abbreviation"],
-        mapping_df["Town Name"]
-    ))
+    if not all_frames:
+        print("No valid contest data collected — nothing to save")
+        return
 
-    # Normalize SSSL Location to match mapping file
-    master_df["SSSL Field Name"] = master_df["Location"].apply(normalize_location)
+    combined = pd.concat(all_frames, ignore_index=True)
+    combined["Season"] = SEASON_LABEL
+    combined["Last Updated"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    # Apply field mapping
-    master_df["Schedule Name"] = master_df["SSSL Field Name"].map(FIELD_MAP)
+    with pd.ExcelWriter(SAVE_PATH, engine="xlsxwriter") as writer:
+        combined.to_excel(writer, sheet_name="SSSL Schedule", index=False)
 
-    # Report missing mappings (using normalized SSSL Field Name)
-    missing = master_df[master_df["Schedule Name"].isna()]["SSSL Field Name"].unique()
-    if len(missing) > 0:
-        print("\n⚠️ Missing TS codes for the following SSSL field names:")
-        for m in missing:
-            if isinstance(m, str) and m.strip():
-                print(f"   - {m}")
-
-    # -----------------------------
-    # Build HAYSA Team List
-    # -----------------------------
-    visitor_hola = master_df["Visitor"][master_df["Visitor"].str.contains("HOLA", na=False)]
-    home_hola = master_df["Home"][master_df["Home"].str.contains("HOLA", na=False)]
-    hola_teams = pd.concat([visitor_hola, home_hola]).drop_duplicates().sort_values()
-
-    hayasa_df = pd.DataFrame({"Team Name": hola_teams})
-
-    # -----------------------------
-    # Build Unique Town List (Other Towns)
-    # -----------------------------
-    visitor_other = master_df["Visitor"][~master_df["Visitor"].str.contains("HOLA", na=False)]
-    home_other = master_df["Home"][~master_df["Home"].str.contains("HOLA", na=False)]
-    other_teams = pd.concat([visitor_other, home_other]).drop_duplicates().sort_values()
-
-    # Extract town abbreviation, then map to Town Name via TOWN_MAP
-    town_abbrs = other_teams.apply(extract_town_abbr)
-    town_names = town_abbrs.apply(lambda abbr: TOWN_MAP.get(abbr, abbr))
-
-    # Unique, sorted list of town names
-    town_names = town_names.drop_duplicates().sort_values()
-
-    other_df = pd.DataFrame({"Town Name": town_names})
-
-    # -----------------------------
-    # Save Excel Output
-    # -----------------------------
-    with pd.ExcelWriter(save_path) as writer:
-        # Main schedule with both raw Location and Schedule Name
-        master_df.to_excel(writer, index=False, sheet_name="SSSL Schedule")
-        hayasa_df.to_excel(writer, index=False, sheet_name="HAYSA Teams")
-        other_df.to_excel(writer, index=False, sheet_name="Other Towns")
-
-    print(f"\nSaved SSSL schedule to {save_path}")
+    print(f"Excel file saved: {SAVE_PATH}")
+    print(f"=== SSSL Schedule Scrape Completed ({SEASON_LABEL}) ===")
 
 
 def main():
-    asyncio.run(run_sssl_scraper())
+    run_sssl_scraper()
 
 
 if __name__ == "__main__":
