@@ -1,17 +1,19 @@
 import pandas as pd
+from pathlib import Path
 
 # -----------------------------
-# Config
+# Paths (repo-relative)
 # -----------------------------
-SSSL_FILE = "SSSL_Spring_2026_Schedule.xlsx"
+REPO_ROOT = Path(__file__).resolve().parents[0]
+
+SSSL_FILE = REPO_ROOT / "data" / "sssl" / "SSSL_Spring_2026_Schedule.xlsx"
+TS_FILE   = REPO_ROOT / "data" / "haysa" / "HAYSA_Spring_2026_Schedule.xlsx"
+OUTPUT_FILE = REPO_ROOT / "data" / "merged" / "Schedule_Comparison_2026.xlsx"
+
 SSSL_SHEET = "SSSL Schedule"
+TS_SHEET   = "HAYSA Schedule"
 
-TS_FILE = "HAYSA_Spring_2026_Schedule.xlsx"
-TS_SHEET = "HAYSA Schedule"   # adjust if your TS sheet is named differently
-
-OUTPUT_FILE = "Schedule_Comparison_2026.xlsx"
-
-HAYSA_TAG = "HOLA"  # how HAYSA teams are tagged in SSSL
+HAYSA_TAG = "HOLA"   # how HAYSA teams appear in SSSL
 
 
 # -----------------------------
@@ -24,11 +26,7 @@ def normalize_str(x):
 
 
 def build_key(df, date_col, time_col, field_col, home_col, away_col):
-    """
-    Build a comparison key:
-    Date | Time | Field | Home | Visitor
-    All normalized to avoid whitespace issues.
-    """
+    """Build a normalized comparison key."""
     return (
         df[date_col].astype(str).apply(normalize_str)
         + " | "
@@ -45,11 +43,12 @@ def build_key(df, date_col, time_col, field_col, home_col, away_col):
 # -----------------------------
 # Load Data
 # -----------------------------
-print("Loading SSSL schedule...")
+print(f"Loading SSSL schedule from {SSSL_FILE} ...")
 sssl_df = pd.read_excel(SSSL_FILE, sheet_name=SSSL_SHEET)
 
-print("Loading TS schedule...")
+print(f"Loading HAYSA schedule from {TS_FILE} ...")
 ts_df = pd.read_excel(TS_FILE, sheet_name=TS_SHEET)
+
 
 # -----------------------------
 # Filter SSSL to HAYSA games only
@@ -59,13 +58,11 @@ sssl_haysa = sssl_df[
     | sssl_df["Home"].astype(str).str.contains(HAYSA_TAG, na=False)
 ].copy()
 
+
 # -----------------------------
 # Build comparison keys
 # -----------------------------
-# Assumptions:
-#  - SSSL: Date, Time, Schedule Name, Home, Visitor
-#  - TS:   Date, Time, Field (TS code), Home, Visitor
-# Adjust TS column names here if needed.
+# SSSL uses "Schedule Name" (TS field code)
 sssl_haysa["Key"] = build_key(
     sssl_haysa,
     date_col="Date",
@@ -75,14 +72,16 @@ sssl_haysa["Key"] = build_key(
     away_col="Visitor",
 )
 
+# TS scraper uses "Location" as the TS field code
 ts_df["Key"] = build_key(
     ts_df,
     date_col="Date",
     time_col="Time",
-    field_col="Field",      # <-- change if your TS field column is named differently
+    field_col="Location",   # <-- correct for your TS scraper
     home_col="Home",
-    away_col="Visitor",
+    away_col="Away",        # <-- TS uses "Away", not "Visitor"
 )
+
 
 # -----------------------------
 # Compare
@@ -96,7 +95,7 @@ ts_only_keys = ts_keys - sssl_keys
 sssl_only = sssl_haysa[sssl_haysa["Key"].isin(sssl_only_keys)].copy()
 ts_only = ts_df[ts_df["Key"].isin(ts_only_keys)].copy()
 
-# For readability, put the key at the front
+# Put Key first
 if not sssl_only.empty:
     cols = ["Key"] + [c for c in sssl_only.columns if c != "Key"]
     sssl_only = sssl_only[cols]
@@ -105,9 +104,12 @@ if not ts_only.empty:
     cols = ["Key"] + [c for c in ts_only.columns if c != "Key"]
     ts_only = ts_only[cols]
 
+
 # -----------------------------
 # Save Comparison Report
 # -----------------------------
+OUTPUT_FILE.parent.mkdir(parents=True, exist_ok=True)
+
 with pd.ExcelWriter(OUTPUT_FILE) as writer:
     sssl_haysa.to_excel(writer, index=False, sheet_name="SSSL HAYSA Games")
     ts_df.to_excel(writer, index=False, sheet_name="TS Games")
