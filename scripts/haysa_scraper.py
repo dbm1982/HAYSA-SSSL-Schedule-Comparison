@@ -95,7 +95,12 @@ async def get_schedule_links(page):
     for link in links:
         href = await link.get_attribute("href")
         text = (await link.text_content() or "").strip()
+
         if href and "/schedule/" in href.lower():
+            # FIX: Convert relative → absolute URL
+            if href.startswith("/"):
+                href = "https://www.haysa.org" + href
+
             schedule_links.append({"url": href, "division": text})
 
     print(f"Found {len(schedule_links)} schedule links")
