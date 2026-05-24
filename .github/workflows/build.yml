@@ -37,7 +37,8 @@ jobs:
 
       - name: Run comparison script
         run: |
-          python compare_schedules.py
+          python scripts/compare_schedules.py
+
 
       - name: Commit updated schedule files
         run: |
