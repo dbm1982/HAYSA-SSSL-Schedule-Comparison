@@ -282,6 +282,13 @@ async def run_haysa_scraper():
         all_teams = []
 
         for link_info in schedule_links:
+            division = link_info["division"].lower()
+        
+            # Skip Mini-Kickers (no real games, no table)
+            if "mini" in division:
+                print(f"Skipping Mini-Kickers division: {link_info['division']}")
+                continue
+        
             df = await extract_schedule_data(page, link_info["url"], link_info["division"])
             if df is not None and not df.empty:
                 all_schedules.append(df)
@@ -289,6 +296,7 @@ async def run_haysa_scraper():
                 all_teams.extend(df["Away"].tolist())
             else:
                 print(f"No valid data for division '{link_info['division']}'")
+
 
         await browser.close()
 
